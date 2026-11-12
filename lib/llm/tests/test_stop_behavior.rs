@@ -231,6 +231,67 @@ fn hidden_stop_sequence_split_across_tokens_is_not_leaked() {
     );
 }
 
+/// When several stop strings complete inside one decoded chunk, the one that completes
+/// first in the text wins, whatever the order of the request's `stop` list. This is what a
+/// token-at-a-time decoder (and vLLM) returns, so the output must not depend on how many
+/// characters a single token carries.
+#[test]
+fn earliest_completing_hidden_stop_sequence_wins_over_list_order() {
+    // "there" completes "he" at byte 3 and "re" at byte 5.
+    for stops in [vec!["re", "he"], vec!["he", "re"]] {
+        let first = stops[0];
+        let mut decoder = make_decoder(None, None, None, Some(stops.clone()), false);
+        let result = decoder.process_token_ids(&[THERE]).unwrap();
+
+        assert_eq!(result.text.as_deref(), Some("t"), "stop={stops:?}");
+        assert!(
+            matches!(
+                result.stop_trigger,
+                Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "he"
+            ),
+            "stop={stops:?} (first listed: {first})"
+        );
+    }
+}
+
+#[test]
+fn earliest_completing_visible_stop_sequence_wins_over_list_order() {
+    for stops in [vec!["re", "he"], vec!["he", "re"]] {
+        let mut decoder = make_decoder(None, None, None, Some(stops.clone()), true);
+        let result = decoder.process_token_ids(&[THERE]).unwrap();
+
+        assert_eq!(result.text.as_deref(), Some("the"), "stop={stops:?}");
+        assert!(
+            matches!(
+                result.stop_trigger,
+                Some(StopTrigger::VisibleStopSequenceDetected(ref s)) if s == "he"
+            ),
+            "stop={stops:?}"
+        );
+    }
+}
+
+/// Stop strings that complete on the same byte are tie-broken by list order.
+#[test]
+fn stop_sequences_completing_together_use_list_order() {
+    // "there" ends both "re" and "ere" at byte 5; "ere" starts first.
+    let mut decoder = make_decoder(None, None, None, Some(vec!["re", "ere"]), false);
+    let result = decoder.process_token_ids(&[THERE]).unwrap();
+    assert_eq!(result.text.as_deref(), Some("the"));
+    assert!(matches!(
+        result.stop_trigger,
+        Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "re"
+    ));
+
+    let mut decoder = make_decoder(None, None, None, Some(vec!["ere", "re"]), false);
+    let result = decoder.process_token_ids(&[THERE]).unwrap();
+    assert_eq!(result.text.as_deref(), Some("th"));
+    assert!(matches!(
+        result.stop_trigger,
+        Some(StopTrigger::HiddenStopSequenceDetected(ref s)) if s == "ere"
+    ));
+}
+
 /// A withheld candidate prefix that turns out not to be part of the stop sequence must be
 /// released once it can no longer complete, rather than being lost forever.
 #[test]

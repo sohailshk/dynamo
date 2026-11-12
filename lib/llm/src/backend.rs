@@ -1151,6 +1151,25 @@ impl Decoder {
         Ok(decoded)
     }
 
+    /// Returns `(start, end, sequence)` of the stop sequence in `seqs` that completes first
+    /// in `jail` (smallest end offset, leftmost occurrence of each), breaking ties by list
+    /// order.
+    fn earliest_completing_stop<'a>(
+        jail: &str,
+        seqs: &'a [String],
+    ) -> Option<(usize, usize, &'a String)> {
+        let mut best: Option<(usize, usize, &'a String)> = None;
+        for seq in seqs {
+            if let Some(offset) = galil_seiferas::gs_find(jail.as_bytes(), seq.as_bytes()) {
+                let end = offset + seq.len();
+                if best.is_none_or(|(_, best_end, _)| end < best_end) {
+                    best = Some((offset, end, seq));
+                }
+            }
+        }
+        best
+    }
+
     fn process_decoded_text(&mut self, decoded_text: Option<String>) -> Result<StepResult> {
         // check stop sequences - the jail will always hold at least the largest stop sequence
         // if jail_max_bytes is 0, then there are no stop sequences
@@ -1163,42 +1182,42 @@ impl Decoder {
             let release_start = self.jail.len() - self.jailed_bytes;
             self.jail.push_str(token_text);
 
-            // Check hidden stop sequences first (excluded from output)
-            for seq in &self.hidden_stop_sequences {
-                if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
-                {
-                    // return only new bytes after release_start .. offset (excluding stop sequence)
-                    // example: seq = "ox", token = "boxes", return "b"
-                    //
-                    // we might have returned a partial match, if so, then offset < release_start
-                    // in that case, we return no text
-                    let partial_token = (offset >= release_start)
-                        .then(|| self.jail[release_start..offset].to_string())
-                        .filter(|s| !s.is_empty());
-                    self.jailed_bytes = 0;
-                    return Ok(StepResult::with_stop_trigger(
-                        partial_token,
-                        StopTrigger::HiddenStopSequenceDetected(seq.to_string()),
-                    ));
-                }
+            // Several stop sequences can complete within one chunk, and the request's list
+            // order says nothing about which came first in the text. Pick the one that
+            // completes earliest, as a token-at-a-time decoder would, so the output does not
+            // depend on how many characters one token carries. Ties go to list order, hidden
+            // sequences before visible ones.
+            let hidden = Self::earliest_completing_stop(&self.jail, &self.hidden_stop_sequences);
+            let visible = Self::earliest_completing_stop(&self.jail, &self.visible_stop_sequences);
+            let hidden_wins = match (hidden, visible) {
+                (Some((_, h_end, _)), Some((_, v_end, _))) => h_end <= v_end,
+                (Some(_), None) => true,
+                _ => false,
+            };
+
+            if hidden_wins && let Some((offset, _, seq)) = hidden {
+                // return only new bytes after release_start .. offset (excluding stop sequence)
+                // example: seq = "ox", token = "boxes", return "b"
+                //
+                // we might have returned a partial match, if so, then offset < release_start
+                // in that case, we return no text
+                let partial_token = (offset >= release_start)
+                    .then(|| self.jail[release_start..offset].to_string())
+                    .filter(|s| !s.is_empty());
+                let trigger = StopTrigger::HiddenStopSequenceDetected(seq.to_string());
+                self.jailed_bytes = 0;
+                return Ok(StepResult::with_stop_trigger(partial_token, trigger));
             }
 
-            // Check visible stop sequences (included in output)
-            for seq in &self.visible_stop_sequences {
-                if let Some(offset) = galil_seiferas::gs_find(self.jail.as_bytes(), seq.as_bytes())
-                {
-                    // For visible stop sequences, include the stop string in the output
-                    // Return all text from release_start up to and including the stop sequence
-                    let stop_end = offset + seq.len();
-                    let token_with_stop = (stop_end > release_start)
-                        .then(|| self.jail[release_start..stop_end].to_string())
-                        .filter(|s| !s.is_empty());
-                    self.jailed_bytes = 0;
-                    return Ok(StepResult::with_stop_trigger(
-                        token_with_stop,
-                        StopTrigger::VisibleStopSequenceDetected(seq.to_string()),
-                    ));
-                }
+            if let Some((_, stop_end, seq)) = visible {
+                // For visible stop sequences, include the stop string in the output
+                // Return all text from release_start up to and including the stop sequence
+                let token_with_stop = (stop_end > release_start)
+                    .then(|| self.jail[release_start..stop_end].to_string())
+                    .filter(|s| !s.is_empty());
+                let trigger = StopTrigger::VisibleStopSequenceDetected(seq.to_string());
+                self.jailed_bytes = 0;
+                return Ok(StepResult::with_stop_trigger(token_with_stop, trigger));
             }
 
             // No complete match. Withhold the longest tail of `jail` that is still a viable
